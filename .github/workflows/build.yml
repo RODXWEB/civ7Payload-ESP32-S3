@@ -1,0 +1,33 @@
+name: build-firmware
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build mit ESP-IDF v5.4.4 und ein-Datei-Image erzeugen
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4.4
+          target: esp32s3
+          command: >-
+            idf.py set-target esp32s3 &&
+            idf.py build &&
+            cd build &&
+            esptool.py --chip esp32s3 merge_bin -o ../firmware-merged.bin @flash_args
+
+      - name: Artefakte hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: |
+            firmware-merged.bin
+            build/*.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
