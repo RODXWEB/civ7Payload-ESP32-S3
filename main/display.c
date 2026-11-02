@@ -1,37 +1,68 @@
 #include "display.h"
-
+ 
 #include <string.h>
-
+ 
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
-#include "esp_lcd_co5300.h"
 #include "esp_lcd_panel_io.h"
-#include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
-
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+ 
+/* ========================================================================
+ * Pocket Dongle S3 / LilyGO T-Dongle-S3 — 0,96" ST7735 (80x160), SPI.
+ *
+ * Pinout (vom Nutzer bestaetigt):
+ *   SCLK = GPIO13, MOSI/SDA = GPIO12, RST = GPIO11,
+ *   DC/A0 = GPIO10, CS = GPIO9, BL (Backlight) = GPIO8
+ * ====================================================================== */
+ 
+#define PIN_SCLK 13
+#define PIN_MOSI 12
+#define PIN_RST 11
+#define PIN_DC 10
+#define PIN_CS 9
+#define PIN_BL 8
+ 
 #define LCD_HOST SPI2_HOST
-#define LCD_H_RES 410
-#define LCD_V_RES 502
-
-#define PIN_SCLK 11
-#define PIN_D0 4
-#define PIN_D1 5
-#define PIN_D2 6
-#define PIN_D3 7
-#define PIN_CS 12
-#define PIN_RST 8
-#define COL_OFFSET 22
-
-#define BAND_H 56
-#define SCALE 4
+#define PIXEL_CLK_HZ (20 * 1000 * 1000) /* 20 MHz, sicher fuer ST7735 */
+ 
+/* Querformat: 160 breit x 80 hoch. */
+#define LCD_W 160
+#define LCD_H 80
+ 
+/* ------------------------------------------------------------------------
+ * TUNING — diese 0,96"-Panels unterscheiden sich je nach Charge. Falls das
+ * Bild nicht stimmt, hier anpassen (jeweils neu bauen + flashen):
+ *
+ *  - Bild horizontal/vertikal verschoben  -> X_OFFSET / Y_OFFSET aendern
+ *                                             (typisch 1/26 ODER 0/24).
+ *  - Farben wirken invertiert (Negativ)    -> INVERT_COLORS auf 0 setzen.
+ *  - Rot und Blau vertauscht               -> COLOR_BGR umschalten (0<->1).
+ *  - Bild steht auf dem Kopf / gespiegelt  -> MADCTL_BASE anderer Wert
+ *                                             (0x60, 0xA0, 0xC0 oder 0x00).
+ * ---------------------------------------------------------------------- */
+#define X_OFFSET 1
+#define Y_OFFSET 26
+#define INVERT_COLORS 1
+#define COLOR_BGR 1
+#define MADCTL_BASE 0x60 /* MX|MV = Querformat */
+ 
+#define MADCTL_VAL (MADCTL_BASE | (COLOR_BGR ? 0x08 : 0x00))
+ 
+/* Font-Skalierung: 160px breit, 5x7-Font. SCALE 3 -> ~18px pro Zeichen.
+ * Lange Woerter (>8 Zeichen) ggf. auf 2 reduzieren. */
+#define SCALE 3
 #define ADVANCE (6 * SCALE)
-
+ 
 static const char *TAG = "display";
-static esp_lcd_panel_handle_t s_panel;
+static esp_lcd_panel_io_handle_t s_io;
+static uint16_t *s_fb; /* Framebuffer, Bytes bereits getauscht (big-endian) */
 static display_state_t s_state;
 static bool s_ready;
-
-/* 5x7, colunas (bit 0 = linha do topo). A-Z e espaco. */
+ 
+/* 5x7, Spalten (bit 0 = oberste Zeile). A-Z und Leerzeichen. */
 static const uint8_t FONT[27][5] = {
     {0x7E, 0x11, 0x11, 0x11, 0x7E}, /* A */
     {0x7F, 0x49, 0x49, 0x49, 0x36}, /* B */
@@ -59,19 +90,23 @@ static const uint8_t FONT[27][5] = {
     {0x63, 0x14, 0x08, 0x14, 0x63}, /* X */
     {0x07, 0x08, 0x70, 0x08, 0x07}, /* Y */
     {0x61, 0x51, 0x49, 0x45, 0x43}, /* Z */
-    {0x00, 0x00, 0x00, 0x00, 0x00}, /* espaco */
+    {0x00, 0x00, 0x00, 0x00, 0x00}, /* Leerzeichen */
 };
-
+ 
 static uint16_t swap16(uint16_t c) {
   return (uint16_t)((c >> 8) | (c << 8));
 }
-
-static void memset_band(uint16_t *buf, int w, int h, uint16_t color) {
-  uint16_t v = swap16(color);
-  for (int i = 0; i < w * h; i++) buf[i] = v;
+ 
+static void tx_cmd(uint8_t cmd, const uint8_t *data, size_t len) {
+  esp_lcd_panel_io_tx_param(s_io, cmd, data, len);
 }
-
-static void draw_text(uint16_t *buf, int x, int y, const char *s, uint16_t color) {
+ 
+static void fill_fb(uint16_t color) {
+  uint16_t v = swap16(color);
+  for (int i = 0; i < LCD_W * LCD_H; i++) s_fb[i] = v;
+}
+ 
+static void draw_text(int x, int y, const char *s, uint16_t color) {
   uint16_t v = swap16(color);
   for (; *s; s++) {
     char c = *s;
@@ -84,7 +119,8 @@ static void draw_text(uint16_t *buf, int x, int y, const char *s, uint16_t color
           for (int sx = 0; sx < SCALE; sx++) {
             int px = x + col * SCALE + sx;
             int py = y + row * SCALE + sy;
-            if (px >= 0 && px < LCD_H_RES) buf[py * LCD_H_RES + px] = v;
+            if (px >= 0 && px < LCD_W && py >= 0 && py < LCD_H)
+              s_fb[py * LCD_W + px] = v;
           }
         }
       }
@@ -92,91 +128,135 @@ static void draw_text(uint16_t *buf, int x, int y, const char *s, uint16_t color
     x += ADVANCE;
   }
 }
-
+ 
+static void flush_fb(void) {
+  int x0 = X_OFFSET, y0 = Y_OFFSET;
+  int x1 = X_OFFSET + LCD_W - 1, y1 = Y_OFFSET + LCD_H - 1;
+  uint8_t caset[4] = {x0 >> 8, x0 & 0xFF, x1 >> 8, x1 & 0xFF};
+  uint8_t raset[4] = {y0 >> 8, y0 & 0xFF, y1 >> 8, y1 & 0xFF};
+  tx_cmd(0x2A, caset, 4); /* CASET */
+  tx_cmd(0x2B, raset, 4); /* RASET */
+  esp_lcd_panel_io_tx_color(s_io, 0x2C, s_fb, LCD_W * LCD_H * 2); /* RAMWR */
+}
+ 
 static void paint(display_state_t state) {
   uint16_t bg, fg;
   const char *label;
   switch (state) {
     case DISPLAY_RUNNING:
-      bg = 0xFD20; /* laranja */
+      bg = 0xFD20; /* orange */
       fg = 0x0000;
-      label = "RODANDO";
+      label = "LAEUFT";
       break;
     case DISPLAY_DONE:
-      bg = 0x07E0; /* verde */
+      bg = 0x07E0; /* gruen */
       fg = 0x0000;
-      label = "TERMINADO";
+      label = "FERTIG";
       break;
     default:
-      bg = 0xF800; /* vermelho */
+      bg = 0xF800; /* rot */
       fg = 0xFFFF;
-      label = "PARADO";
+      label = "GESTOPPT";
       break;
   }
-
-  uint16_t *buf = heap_caps_malloc(LCD_H_RES * BAND_H * 2,
-                                   MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-  if (!buf) {
-    ESP_LOGW(TAG, "sem memoria para o status");
-    return;
-  }
-  memset_band(buf, LCD_H_RES, BAND_H, bg);
-
+ 
+  fill_fb(bg);
+ 
   int len = (int)strlen(label);
   int text_w = len * ADVANCE - SCALE;
-  int x = (LCD_H_RES - text_w) / 2;
-  int y = (BAND_H - 7 * SCALE) / 2;
-  draw_text(buf, x, y, label, fg);
-
-  int y0 = (LCD_V_RES - BAND_H) / 2;
-  esp_lcd_panel_draw_bitmap(s_panel, 0, y0, LCD_H_RES, y0 + BAND_H, buf);
-  free(buf);
+  int x = (LCD_W - text_w) / 2;
+  int y = (LCD_H - 7 * SCALE) / 2;
+  if (x < 0) x = 0;
+  draw_text(x, y, label, fg);
+  flush_fb();
 }
-
+ 
+static void st7735_init_seq(void) {
+  tx_cmd(0x01, NULL, 0); /* SWRESET */
+  vTaskDelay(pdMS_TO_TICKS(150));
+  tx_cmd(0x11, NULL, 0); /* SLPOUT */
+  vTaskDelay(pdMS_TO_TICKS(255));
+ 
+  uint8_t colmod = 0x05; /* 16 bit/pixel */
+  tx_cmd(0x3A, &colmod, 1);
+ 
+  uint8_t madctl = MADCTL_VAL;
+  tx_cmd(0x36, &madctl, 1);
+ 
+#if INVERT_COLORS
+  tx_cmd(0x21, NULL, 0); /* INVON */
+#else
+  tx_cmd(0x20, NULL, 0); /* INVOFF */
+#endif
+ 
+  tx_cmd(0x13, NULL, 0); /* NORON */
+  vTaskDelay(pdMS_TO_TICKS(10));
+  tx_cmd(0x29, NULL, 0); /* DISPON */
+  vTaskDelay(pdMS_TO_TICKS(100));
+}
+ 
 void display_init(void) {
-  spi_bus_config_t buscfg = CO5300_PANEL_BUS_QSPI_CONFIG(
-      PIN_SCLK, PIN_D0, PIN_D1, PIN_D2, PIN_D3,
-      LCD_H_RES * BAND_H * 2);
+  /* Backlight an. */
+  gpio_config_t bl = {.pin_bit_mask = 1ULL << PIN_BL,
+                      .mode = GPIO_MODE_OUTPUT};
+  gpio_config(&bl);
+  gpio_set_level(PIN_BL, 1);
+ 
+  /* Hardware-Reset. */
+  gpio_config_t rst = {.pin_bit_mask = 1ULL << PIN_RST,
+                       .mode = GPIO_MODE_OUTPUT};
+  gpio_config(&rst);
+  gpio_set_level(PIN_RST, 1);
+  vTaskDelay(pdMS_TO_TICKS(10));
+  gpio_set_level(PIN_RST, 0);
+  vTaskDelay(pdMS_TO_TICKS(20));
+  gpio_set_level(PIN_RST, 1);
+  vTaskDelay(pdMS_TO_TICKS(150));
+ 
+  spi_bus_config_t buscfg = {
+      .sclk_io_num = PIN_SCLK,
+      .mosi_io_num = PIN_MOSI,
+      .miso_io_num = -1,
+      .quadwp_io_num = -1,
+      .quadhd_io_num = -1,
+      .max_transfer_sz = LCD_W * LCD_H * 2 + 16,
+  };
   if (spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO) != ESP_OK) {
     ESP_LOGW(TAG, "spi_bus_initialize falhou");
     return;
   }
-
-  esp_lcd_panel_io_handle_t io = NULL;
-  esp_lcd_panel_io_spi_config_t io_config =
-      CO5300_PANEL_IO_QSPI_CONFIG(PIN_CS, NULL, NULL);
+ 
+  esp_lcd_panel_io_spi_config_t io_config = {
+      .cs_gpio_num = PIN_CS,
+      .dc_gpio_num = PIN_DC,
+      .spi_mode = 0,
+      .pclk_hz = PIXEL_CLK_HZ,
+      .trans_queue_depth = 10,
+      .lcd_cmd_bits = 8,
+      .lcd_param_bits = 8,
+  };
   if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_config,
-                               &io) != ESP_OK) {
+                               &s_io) != ESP_OK) {
     ESP_LOGW(TAG, "panel io falhou");
     return;
   }
-
-  co5300_vendor_config_t vendor = {0};
-  vendor.flags.use_qspi_interface = 1;
-  esp_lcd_panel_dev_config_t panel_config = {
-      .reset_gpio_num = PIN_RST,
-      .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-      .bits_per_pixel = 16,
-      .vendor_config = &vendor,
-  };
-  if (esp_lcd_new_panel_co5300(io, &panel_config, &s_panel) != ESP_OK) {
-    ESP_LOGW(TAG, "painel falhou");
+ 
+  s_fb = heap_caps_malloc(LCD_W * LCD_H * 2, MALLOC_CAP_DMA);
+  if (!s_fb) {
+    ESP_LOGW(TAG, "sem memoria para framebuffer");
     return;
   }
-
-  esp_lcd_panel_reset(s_panel);
-  esp_lcd_panel_init(s_panel);
-  esp_lcd_panel_set_gap(s_panel, COL_OFFSET, 0);
-  esp_lcd_panel_disp_on_off(s_panel, true);
-  esp_lcd_panel_co5300_set_brightness(s_panel, 100);
-
+ 
+  st7735_init_seq();
+ 
   s_ready = true;
   s_state = DISPLAY_STOPPED;
   paint(s_state);
 }
-
+ 
 void display_set_status(display_state_t state) {
   if (!s_ready || state == s_state) return;
   s_state = state;
   paint(state);
 }
+ 
