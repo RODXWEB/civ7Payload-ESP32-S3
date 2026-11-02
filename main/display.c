@@ -1,7 +1,7 @@
 #include "display.h"
- 
+
 #include <string.h>
- 
+
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_heap_caps.h"
@@ -9,29 +9,29 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
- 
+
 /* ========================================================================
  * Pocket Dongle S3 / LilyGO T-Dongle-S3 — 0,96" ST7735 (80x160), SPI.
  *
- * Pinout (vom Nutzer bestaetigt):
- *   SCLK = GPIO13, MOSI/SDA = GPIO12, RST = GPIO11,
- *   DC/A0 = GPIO10, CS = GPIO9, BL (Backlight) = GPIO8
+ * Pinout (Pocket-Dongle-S3, aus der funktionierenden PS5-DISPLAY-Firmware):
+ *   SCLK = GPIO10, MOSI = GPIO11, CS = GPIO12,
+ *   DC = GPIO13, RST = GPIO14.
+ *   Backlight ist fest verdrahtet (kein Steuer-Pin).
  * ====================================================================== */
- 
-#define PIN_SCLK 13
-#define PIN_MOSI 12
-#define PIN_RST 11
-#define PIN_DC 10
-#define PIN_CS 9
-#define PIN_BL 8
- 
+
+#define PIN_SCLK 10
+#define PIN_MOSI 11
+#define PIN_CS 12
+#define PIN_DC 13
+#define PIN_RST 14
+
 #define LCD_HOST SPI2_HOST
 #define PIXEL_CLK_HZ (20 * 1000 * 1000) /* 20 MHz, sicher fuer ST7735 */
- 
+
 /* Querformat: 160 breit x 80 hoch. */
 #define LCD_W 160
 #define LCD_H 80
- 
+
 /* ------------------------------------------------------------------------
  * TUNING — diese 0,96"-Panels unterscheiden sich je nach Charge. Falls das
  * Bild nicht stimmt, hier anpassen (jeweils neu bauen + flashen):
@@ -46,22 +46,22 @@
 #define X_OFFSET 1
 #define Y_OFFSET 26
 #define INVERT_COLORS 1
-#define COLOR_BGR 1
-#define MADCTL_BASE 0x60 /* MX|MV = Querformat */
- 
+#define COLOR_BGR 0        /* Pocket-Dongle-Panel ist RGB (PLUGIN-Variante) */
+#define MADCTL_BASE 0xA0   /* MY|MV = Rotation 1, 160x80 Querformat */
+
 #define MADCTL_VAL (MADCTL_BASE | (COLOR_BGR ? 0x08 : 0x00))
- 
+
 /* Font-Skalierung: 160px breit, 5x7-Font. SCALE 3 -> ~18px pro Zeichen.
  * Lange Woerter (>8 Zeichen) ggf. auf 2 reduzieren. */
 #define SCALE 3
 #define ADVANCE (6 * SCALE)
- 
+
 static const char *TAG = "display";
 static esp_lcd_panel_io_handle_t s_io;
 static uint16_t *s_fb; /* Framebuffer, Bytes bereits getauscht (big-endian) */
 static display_state_t s_state;
 static bool s_ready;
- 
+
 /* 5x7, Spalten (bit 0 = oberste Zeile). A-Z und Leerzeichen. */
 static const uint8_t FONT[27][5] = {
     {0x7E, 0x11, 0x11, 0x11, 0x7E}, /* A */
@@ -92,20 +92,20 @@ static const uint8_t FONT[27][5] = {
     {0x61, 0x51, 0x49, 0x45, 0x43}, /* Z */
     {0x00, 0x00, 0x00, 0x00, 0x00}, /* Leerzeichen */
 };
- 
+
 static uint16_t swap16(uint16_t c) {
   return (uint16_t)((c >> 8) | (c << 8));
 }
- 
+
 static void tx_cmd(uint8_t cmd, const uint8_t *data, size_t len) {
   esp_lcd_panel_io_tx_param(s_io, cmd, data, len);
 }
- 
+
 static void fill_fb(uint16_t color) {
   uint16_t v = swap16(color);
   for (int i = 0; i < LCD_W * LCD_H; i++) s_fb[i] = v;
 }
- 
+
 static void draw_text(int x, int y, const char *s, uint16_t color) {
   uint16_t v = swap16(color);
   for (; *s; s++) {
@@ -128,7 +128,7 @@ static void draw_text(int x, int y, const char *s, uint16_t color) {
     x += ADVANCE;
   }
 }
- 
+
 static void flush_fb(void) {
   int x0 = X_OFFSET, y0 = Y_OFFSET;
   int x1 = X_OFFSET + LCD_W - 1, y1 = Y_OFFSET + LCD_H - 1;
@@ -138,7 +138,7 @@ static void flush_fb(void) {
   tx_cmd(0x2B, raset, 4); /* RASET */
   esp_lcd_panel_io_tx_color(s_io, 0x2C, s_fb, LCD_W * LCD_H * 2); /* RAMWR */
 }
- 
+
 static void paint(display_state_t state) {
   uint16_t bg, fg;
   const char *label;
@@ -159,9 +159,9 @@ static void paint(display_state_t state) {
       label = "GESTOPPT";
       break;
   }
- 
+
   fill_fb(bg);
- 
+
   int len = (int)strlen(label);
   int text_w = len * ADVANCE - SCALE;
   int x = (LCD_W - text_w) / 2;
@@ -170,38 +170,34 @@ static void paint(display_state_t state) {
   draw_text(x, y, label, fg);
   flush_fb();
 }
- 
+
 static void st7735_init_seq(void) {
   tx_cmd(0x01, NULL, 0); /* SWRESET */
   vTaskDelay(pdMS_TO_TICKS(150));
   tx_cmd(0x11, NULL, 0); /* SLPOUT */
   vTaskDelay(pdMS_TO_TICKS(255));
- 
+
   uint8_t colmod = 0x05; /* 16 bit/pixel */
   tx_cmd(0x3A, &colmod, 1);
- 
+
   uint8_t madctl = MADCTL_VAL;
   tx_cmd(0x36, &madctl, 1);
- 
+
 #if INVERT_COLORS
   tx_cmd(0x21, NULL, 0); /* INVON */
 #else
   tx_cmd(0x20, NULL, 0); /* INVOFF */
 #endif
- 
+
   tx_cmd(0x13, NULL, 0); /* NORON */
   vTaskDelay(pdMS_TO_TICKS(10));
   tx_cmd(0x29, NULL, 0); /* DISPON */
   vTaskDelay(pdMS_TO_TICKS(100));
 }
- 
+
 void display_init(void) {
-  /* Backlight an. */
-  gpio_config_t bl = {.pin_bit_mask = 1ULL << PIN_BL,
-                      .mode = GPIO_MODE_OUTPUT};
-  gpio_config(&bl);
-  gpio_set_level(PIN_BL, 1);
- 
+  /* Backlight ist bei diesem Board fest verdrahtet (kein GPIO noetig). */
+
   /* Hardware-Reset. */
   gpio_config_t rst = {.pin_bit_mask = 1ULL << PIN_RST,
                        .mode = GPIO_MODE_OUTPUT};
@@ -212,7 +208,7 @@ void display_init(void) {
   vTaskDelay(pdMS_TO_TICKS(20));
   gpio_set_level(PIN_RST, 1);
   vTaskDelay(pdMS_TO_TICKS(150));
- 
+
   spi_bus_config_t buscfg = {
       .sclk_io_num = PIN_SCLK,
       .mosi_io_num = PIN_MOSI,
@@ -225,7 +221,7 @@ void display_init(void) {
     ESP_LOGW(TAG, "spi_bus_initialize falhou");
     return;
   }
- 
+
   esp_lcd_panel_io_spi_config_t io_config = {
       .cs_gpio_num = PIN_CS,
       .dc_gpio_num = PIN_DC,
@@ -240,23 +236,22 @@ void display_init(void) {
     ESP_LOGW(TAG, "panel io falhou");
     return;
   }
- 
+
   s_fb = heap_caps_malloc(LCD_W * LCD_H * 2, MALLOC_CAP_DMA);
   if (!s_fb) {
     ESP_LOGW(TAG, "sem memoria para framebuffer");
     return;
   }
- 
+
   st7735_init_seq();
- 
+
   s_ready = true;
   s_state = DISPLAY_STOPPED;
   paint(s_state);
 }
- 
+
 void display_set_status(display_state_t state) {
   if (!s_ready || state == s_state) return;
   s_state = state;
   paint(state);
 }
- 
