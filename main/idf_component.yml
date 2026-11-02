@@ -1,0 +1,4 @@
+dependencies:
+  espressif/tinyusb: ^0.18.0
+  idf: '>=5.0'
+  espressif/esp_lcd_co5300: '*'
