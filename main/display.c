@@ -46,8 +46,8 @@
 #define X_OFFSET 1
 #define Y_OFFSET 26
 #define INVERT_COLORS 1
-#define COLOR_BGR 0        /* Pocket-Dongle-Panel ist RGB (PLUGIN-Variante) */
-#define MADCTL_BASE 0xA0   /* MY|MV = Rotation 1, 160x80 Querformat */
+#define COLOR_BGR 1        /* Panel ist BGR (am Stick verifiziert) */
+#define MADCTL_BASE 0x60   /* MX|MV = 160x80 Querformat, 180 gedreht (aufrecht) */
 
 #define MADCTL_VAL (MADCTL_BASE | (COLOR_BGR ? 0x08 : 0x00))
 
